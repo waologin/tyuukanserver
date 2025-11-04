@@ -1,5 +1,5 @@
-// server.js
-// Render用 Node.js ウェブプッシュ中継サーバ (ESM)
+// Render用 Node.js ウェブプッシュ中継サーバ
+
 import express from 'express';
 import webpush from 'web-push';
 import bodyParser from 'body-parser';
@@ -7,10 +7,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 
 const app = express();
-
-// ボディサイズ拡大（大きな暗号化データに備える）
-app.use(bodyParser.json({ limit: '10mb' }));
-app.use(bodyParser.urlencoded({ limit: '10mb', extended: true }));
+app.use(bodyParser.json({ limit: '1mb' }));
 
 // -------------------------------
 // 環境変数
@@ -21,27 +18,16 @@ const VAPID_PRIVATE = process.env.VAPID_PRIVATE;
 const SERVER_PRIVKEY_CONTENTS = process.env.SERVER_PRIVKEY_CONTENTS;
 const DB_FILE = process.env.DB_FILE || './db.json';
 
-if (!VAPID_PUBLIC || !VAPID_PRIVATE) {
-  console.warn('Warning: VAPID_PUBLIC or VAPID_PRIVATE not set.');
-}
-if (!SERVER_PRIVKEY_CONTENTS) {
-  console.warn('Warning: SERVER_PRIVKEY_CONTENTS not set.');
-}
-
 // -------------------------------
-// データベース（簡易ファイル）
+// データベース（簡易）
 // -------------------------------
 let messages = [];
-try {
-  if (fs.existsSync(DB_FILE)) {
-    const raw = fs.readFileSync(DB_FILE, 'utf8');
-    messages = raw ? JSON.parse(raw) : [];
-  } else {
-    fs.writeFileSync(DB_FILE, JSON.stringify([]));
+if (fs.existsSync(DB_FILE)) {
+  try {
+    messages = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+  } catch {
+    messages = [];
   }
-} catch (e) {
-  console.error('DBロード失敗', e);
-  messages = [];
 }
 
 function saveMessages() {
@@ -55,113 +41,81 @@ function saveMessages() {
 // -------------------------------
 // Web Push設定
 // -------------------------------
-try {
-  webpush.setVapidDetails(
-    'mailto:noanaonaao6366@gmail.com',
-    VAPID_PUBLIC,
-    VAPID_PRIVATE
-  );
-} catch (e) {
-  console.warn('web-push setVapidDetails error (will show at send time):', e && e.message);
-}
+webpush.setVapidDetails(
+  'mailto:noanaonaao6366@gmail.com',
+  VAPID_PUBLIC,
+  VAPID_PRIVATE
+);
 
 // -------------------------------
-// 受信＆中継エンドポイント
-// リクエスト JSON must contain:
-// {
-//   "encrypted_key": "<base64 RSA-OAEP(SHA256) encrypted AES key>",
-//   "iv": "<base64 IV>",
-//   "payload": "<base64 AES-256-CBC encrypted subscription JSON>",
-//   "message": "<optional message text>"
-// }
+// 受信＆中継
 // -------------------------------
 app.post('/push', async (req, res) => {
   try {
-    const { encrypted_key, iv, payload, message } = req.body;
-    if (!encrypted_key || !iv || !payload) {
+    const { to, iv, payload, message } = req.body;
+    if (!to || !iv || !payload) {
       return res.status(400).json({ error: 'Invalid request (missing fields)' });
     }
 
-    // 1) RSA秘密鍵でAES鍵を復号（OAEP with SHA-256）
-    const privateKeyObj = crypto.createPrivateKey({
+    // 1️⃣ RSA秘密鍵でAES鍵を復号
+    const privateKey = crypto.createPrivateKey({
       key: SERVER_PRIVKEY_CONTENTS,
-      format: 'pem'
+      format: 'pem',
     });
 
-    let aesKey;
-    try {
-      aesKey = crypto.privateDecrypt(
-        {
-          key: privateKeyObj,
-          padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
-          oaepHash: 'sha256'
-        },
-        Buffer.from(encrypted_key, 'base64')
-      );
-    } catch (e) {
-      console.error('RSA復号失敗:', e && e.message);
-      return res.status(400).json({ error: 'RSA decryption failed', detail: e && e.message });
-    }
+    const aesKey = crypto.privateDecrypt(
+      {
+        key: privateKey,
+        padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+        oaepHash: 'sha256',
+      },
+      Buffer.from(to, 'base64')
+    );
 
-    // 2) AESで購読情報を復号（AES-256-CBC + PKCS#7）
+    // 2️⃣ AESで購読情報を復号
     const ivBuf = Buffer.from(iv, 'base64');
-    const encryptedBuf = Buffer.from(payload, 'base64');
+    const encrypted = Buffer.from(payload, 'base64');
+    const decipher = crypto.createDecipheriv('aes-256-cbc', aesKey, ivBuf);
+    let decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+    let decryptedText = decrypted.toString('utf-8');
 
-    let decrypted;
-    try {
-      const decipher = crypto.createDecipheriv('aes-256-cbc', aesKey, ivBuf);
-      decrypted = Buffer.concat([decipher.update(encryptedBuf), decipher.final()]);
-    } catch (e) {
-      console.error('AES復号失敗:', e && e.message);
-      return res.status(400).json({ error: 'AES decryption failed', detail: e && e.message });
-    }
-
-    // PKCS#7 パディング除去
-    const padLen = decrypted[decrypted.length - 1];
-    if (padLen < 1 || padLen > 16) {
-      console.warn('警告: 不正なパディング長', padLen);
-    }
-    const unpadded = decrypted.slice(0, decrypted.length - padLen);
+    // 制御文字や残りパディングを削除
+    decryptedText = decryptedText.replace(/[\u0000-\u0010]+$/g, '');
 
     let subscription;
     try {
-      subscription = JSON.parse(unpadded.toString('utf8'));
-    } catch (e) {
-      console.error('購読情報JSON解析失敗:', e && e.message);
-      return res.status(400).json({ error: 'Invalid subscription JSON', detail: e && e.message });
+      subscription = JSON.parse(decryptedText);
+    } catch (jsonErr) {
+      console.error('❌ JSON parse error:', jsonErr.message);
+      console.error('🔍 Decrypted text (first 200 chars):', decryptedText.slice(0, 200));
+      return res.status(400).json({
+        error: 'Invalid subscription JSON',
+        detail: jsonErr.message,
+      });
     }
 
-    // 3) タイムスタンプと署名（サーバ秘密鍵で署名）
+    // 3️⃣ タイムスタンプと署名
     const time = new Date().toISOString();
     const signer = crypto.createSign('SHA256');
     signer.update((message || '') + time);
-    let signature;
-    try {
-      signature = signer.sign(SERVER_PRIVKEY_CONTENTS, 'base64');
-    } catch (e) {
-      console.error('署名失敗:', e && e.message);
-      signature = null;
-    }
+    const signature = signer.sign(SERVER_PRIVKEY_CONTENTS, 'base64');
 
-    // 4) 保存（簡易）
+    // 4️⃣ メッセージ保存
     const entry = { subscription, message, time, signature };
     messages.push(entry);
     saveMessages();
 
-    // 5) Web Push送信
-    try {
-      await webpush.sendNotification(subscription, JSON.stringify({ message, time, signature }));
-    } catch (e) {
-      console.error('web-push送信失敗:', e);
-      // 送信失敗でも保存はしておく。クライアントへ詳細返す。
-      return res.status(502).json({ error: 'web-push send failed', detail: e && (e.stack || e.message) });
-    }
+    // 5️⃣ Web Push送信
+    await webpush.sendNotification(
+      subscription,
+      JSON.stringify({ message, time, signature })
+    );
 
+    res.json({ ok: true, time });
     console.log('✅ Push送信成功:', subscription.endpoint);
-    return res.json({ ok: true, time });
   } catch (e) {
-    console.error('予期せぬエラー:', e && e.stack ? e.stack : e);
-    return res.status(500).json({ error: e && e.message });
+    console.error('❌ Push送信失敗:', e);
+    res.status(500).json({ error: e.message });
   }
 });
 
