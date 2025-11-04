@@ -52,8 +52,8 @@ webpush.setVapidDetails(
 // -------------------------------
 app.post('/push', async (req, res) => {
   try {
-    const { to, iv, payload, message } = req.body;
-    if (!to || !iv || !payload) {
+    const { encrypted_key, iv, payload, message } = req.body;
+    if (!encrypted_key || !iv || !payload) {
       return res.status(400).json({ error: 'Invalid request (missing fields)' });
     }
 
@@ -68,7 +68,7 @@ app.post('/push', async (req, res) => {
         padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
         oaepHash: 'sha256'
       },
-      Buffer.from(to, 'base64')
+      Buffer.from(encrypted_key, 'base64')
     );
 
     // 2️⃣ AESで購読情報を復号
