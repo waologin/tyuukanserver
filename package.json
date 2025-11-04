@@ -1,0 +1,15 @@
+{
+  "name": "render-push-relay-server",
+  "version": "1.0.0",
+  "description": "Web Push中継サーバ (Render用・ファイル不要版)",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "web-push": "^3.6.0",
+    "body-parser": "^1.20.3"
+  }
+}
