@@ -31,11 +31,6 @@ if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
   console.error('WARNING: VAPID keys not set. Push may fail.');
 }
 
-// ---------- 初期化 ----------
-webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
-const app = express();
-app.use(bodyParser.json({ limit: '512kb' }));
-
 // ---------- ユーティリティ ----------
 const b64ToBuf = (b64) => Buffer.from(b64, 'base64');
 const nowIso = () => new Date().toISOString();
