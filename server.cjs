@@ -149,6 +149,33 @@ app.post('/sendPush', async (req, res) => {
   }
 });
 
+// ---------- 公開鍵取得ユーティリティ ----------
+function getServerPublicKeyPem() {
+  try {
+    const pubKeyObj = crypto.createPublicKey(SERVER_RSA_PRIV_PEM);
+    const pubPem = pubKeyObj.export({ type: 'spki', format: 'pem' });
+    return pubPem;
+  } catch (err) {
+    console.error('failed to derive public key:', err.message);
+    return null;
+  }
+}
+
+// ---------- 公開鍵取得エンドポイント ----------
+app.get('/publicKey', (req, res) => {
+  const pubPem = getServerPublicKeyPem();
+  if (!pubPem) {
+    return res.status(500).json({ error: 'failed to derive public key' });
+  }
+  res.json({ publicKeyPem: pubPem });
+});
+
+// ---------- VAPID 公開鍵取得 ----------
+app.get('/vapidPublicKey', (req, res) => {
+  if (!VAPID_PUBLIC_KEY) return res.status(404).json({ error: 'vapid key not configured' });
+  res.json({ vapidPublicKey: VAPID_PUBLIC_KEY });
+});
+
 // healthチェック
 app.get('/_health', (req, res) => res.json({ status: 'ok', time: nowIso() }));
 
