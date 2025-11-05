@@ -5,134 +5,167 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
 const webpush = require('web-push');
-const { Pool } = require('pg');
+const fs = require('fs');
+const path = require('path');
 const jwt = require('jsonwebtoken');
 
-require('dotenv').config();
+const DB_FILE = process.env.DB_FILE || './db.json';
+const PORT = process.env.PORT || 10000;
+
+// env names from you
+const PRIVATE_KEY_PEM_RAW = process.env.SERVER_PRIVKEY_CONTENTS || process.env.PRIVATE_KEY_PEM;
+const VAPID_PUBLIC = process.env.VAPID_PUBLIC;
+const VAPID_PRIVATE = process.env.VAPID_PRIVATE;
+const JWT_PUBLIC_KEY_PEM = process.env.JWT_PUBLIC_KEY_PEM;
+const JWT_SECRET = process.env.JWT_SECRET;
+
+if (!PRIVATE_KEY_PEM_RAW) {
+  console.error('Missing SERVER_PRIVKEY_CONTENTS / PRIVATE_KEY_PEM env var');
+  process.exit(1);
+}
+if (!VAPID_PUBLIC || !VAPID_PRIVATE) {
+  console.error('Missing VAPID_PUBLIC / VAPID_PRIVATE env var');
+  process.exit(1);
+}
+
+// Convert literal "\n" sequences to actual newlines if necessary
+const PRIVATE_KEY_PEM = PRIVATE_KEY_PEM_RAW.includes('\\n')
+  ? PRIVATE_KEY_PEM_RAW.replace(/\\n/g, '\n')
+  : PRIVATE_KEY_PEM_RAW;
+
+// ensure DB file exists
+function initDb() {
+  if (!fs.existsSync(DB_FILE)) {
+    const base = { push_subscriptions: {}, messages: {} };
+    fs.writeFileSync(DB_FILE, JSON.stringify(base, null, 2));
+  }
+}
+initDb();
+
+function readDb() {
+  const raw = fs.readFileSync(DB_FILE, 'utf8');
+  return JSON.parse(raw);
+}
+function writeDb(db) {
+  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+}
+
+// simple ID generator (UUID v4-like)
+function genId() {
+  return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
+    (c ^ crypto.randomBytes(1)[0] & 15 >> c / 4).toString(16)
+  );
+}
+
+// configure web-push
+webpush.setVapidDetails('mailto:admin@example.com', VAPID_PUBLIC, VAPID_PRIVATE);
 
 const app = express();
 app.use(bodyParser.json({ limit: '1mb' }));
 
-// 環境変数
-const {
-  PRIVATE_KEY_PEM,      // server RSA private key (PEM)
-  JWT_PUBLIC_KEY_PEM,   // JWT 検証用公開鍵（RS256 の場合）
-  JWT_SECRET,           // HS256 の場合
-  VAPID_PUBLIC_KEY,
-  VAPID_PRIVATE_KEY,
-  DATABASE_URL
-} = process.env;
+// helpers
+function b64ToBuf(s) { return Buffer.from(s, 'base64'); }
+function bufToB64(b) { return Buffer.from(b).toString('base64'); }
 
-if (!PRIVATE_KEY_PEM || !(JWT_PUBLIC_KEY_PEM || JWT_SECRET) || !VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY || !DATABASE_URL) {
-  console.error('Required environment variables missing.');
-  process.exit(1);
-}
-
-// PostgreSQL pool
-const pool = new Pool({ connectionString: DATABASE_URL });
-
-// web-push 設定
-webpush.setVapidDetails(
-  'mailto:admin@example.com',
-  VAPID_PUBLIC_KEY,
-  VAPID_PRIVATE_KEY
-);
-
-// --- Helper: base64 <-> Buffer (URL-safe not assumed) ---
-function b64ToBuf(s) {
-  return Buffer.from(s, 'base64');
-}
-function bufToB64(buf) {
-  return buf.toString('base64');
-}
-
-// --- Decrypt wrapped AES key with server RSA private key (RSA-OAEP/SHA-256) ---
+// unwrap AES key (RSA-OAEP SHA-256)
 function unwrapAesKey(wrappedB64) {
   const wrapped = b64ToBuf(wrappedB64);
-  // privateDecrypt with OAEP + SHA-256
-  const priv = PRIVATE_KEY_PEM.replace(/\\n/g, '\n');
-  const decrypted = crypto.privateDecrypt(
-    {
-      key: priv,
-      padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
-      oaepHash: 'sha256'
-    },
-    wrapped
-  );
-  // decrypted is raw AES key (32 bytes expected for AES-256)
-  return decrypted;
+  try {
+    const decrypted = crypto.privateDecrypt(
+      {
+        key: PRIVATE_KEY_PEM,
+        padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+        oaepHash: 'sha256'
+      },
+      wrapped
+    );
+    return decrypted; // Buffer
+  } catch (err) {
+    throw new Error('unwrap_failed:' + (err && err.message));
+  }
 }
 
-// --- Decrypt AES-GCM blob ---
+// decrypt AES-GCM
 function decryptAesGcm(aesKeyBuf, ivB64, cipherB64, authTagB64) {
   const iv = b64ToBuf(ivB64);
-  const ciphertext = b64ToBuf(cipherB64);
+  let ciphertext = b64ToBuf(cipherB64);
 
   const decipher = crypto.createDecipheriv('aes-256-gcm', aesKeyBuf, iv);
   if (authTagB64) {
     const tag = b64ToBuf(authTagB64);
     decipher.setAuthTag(tag);
   } else {
-    // assume tag appended to ciphertext (client-side variant)
-    // Node's GCM expects separate tag; if client appended last 16 bytes, split it
-    // But here we require client to send tag separately for clarity.
+    // If client appended tag at end, split last 16 bytes
+    if (ciphertext.length > 16) {
+      const tag = ciphertext.slice(ciphertext.length - 16);
+      ciphertext = ciphertext.slice(0, ciphertext.length - 16);
+      decipher.setAuthTag(tag);
+    } else {
+      throw new Error('missing_auth_tag');
+    }
   }
 
-  const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-  return decrypted.toString('utf8');
+  const ptBuf = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  return ptBuf.toString('utf8');
 }
 
-// --- Lookup push subscription for a user ---
-async function getPushSubscription(recipientId) {
-  const res = await pool.query('SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = $1', [recipientId]);
-  if (res.rowCount === 0) return null;
-  const row = res.rows[0];
-  return {
-    endpoint: row.endpoint,
-    keys: {
-      p256dh: row.p256dh,
-      auth: row.auth
-    }
-  };
-}
-
-// --- Store message metadata ---
-async function storeMessageMeta({ senderId, recipientId, messageCiphertext, aesIv }) {
-  const q = `
-    INSERT INTO messages (sender_id, recipient_id, message_ciphertext, aes_iv, auth_verified, status, server_timestamp)
-    VALUES ($1, $2, $3, $4, $5, $6, $7)
-    RETURNING id;
-  `;
-  const serverTs = new Date();
-  const params = [senderId, recipientId, messageCiphertext, aesIv, true, 'queued', serverTs];
-  const res = await pool.query(q, params);
-  return { id: res.rows[0].id, serverTimestamp: serverTs };
-}
-
-// --- Public key endpoint (clients fetch server public key) ---
+// Public key endpoint (derive from private)
 app.get('/public-key', (req, res) => {
-  // Optionally, serve a stored public key. For simplicity assume PRIVATE_KEY_PEM contains private key; derive public
   try {
-    const priv = PRIVATE_KEY_PEM.replace(/\\n/g, '\n');
-    const keyObj = crypto.createPrivateKey({ key: priv, format: 'pem' });
+    const keyObj = crypto.createPrivateKey({ key: PRIVATE_KEY_PEM, format: 'pem' });
     const pub = keyObj.export({ type: 'spki', format: 'pem' });
     res.type('text/plain').send(pub);
-  } catch (err) {
-    console.error('failed to derive public key', err);
+  } catch (e) {
+    console.error('public-key error', e);
     res.status(500).json({ error: 'internal' });
   }
 });
 
+// register push subscription
+// body: { userId, subscription }
+app.post('/push-subscriptions', (req, res) => {
+  const { userId, subscription } = req.body;
+  if (!userId || !subscription || !subscription.endpoint) {
+    return res.status(400).json({ error: 'invalid' });
+  }
+
+  const db = readDb();
+  db.push_subscriptions[userId] = {
+    endpoint: subscription.endpoint,
+    keys: subscription.keys || {},
+    updated_at: new Date().toISOString()
+  };
+  writeDb(db);
+  res.status(201).json({ ok: true });
+});
+
+// fetch message by id (recipient should call this after push)
+app.get('/messages/:id', (req, res) => {
+  const id = req.params.id;
+  const db = readDb();
+  const msg = db.messages[id];
+  if (!msg) return res.status(404).json({ error: 'not_found' });
+
+  // NOTE: In production, require authentication/authorization to ensure only recipient can GET
+  res.json({
+    id,
+    senderId: msg.senderId,
+    recipientId: msg.recipientId,
+    messageCiphertext: msg.messageCiphertext,
+    serverTimestamp: msg.serverTimestamp
+  });
+});
+
 /**
  * POST /messages
- * Body:
+ * body:
  * {
  *  senderId, recipientId, messageCiphertext,
- *  wrappedAuthKey, authBlob, authIv, authTag, clientTimestamp
+ *  wrappedAuthKey, authBlob, authIv, authTag?, clientTimestamp?
  * }
  */
 app.post('/messages', async (req, res) => {
-  const body = req.body;
+  const body = req.body || {};
   const {
     senderId,
     recipientId,
@@ -151,104 +184,107 @@ app.post('/messages', async (req, res) => {
   try {
     // 1) unwrap AES key
     const aesKeyBuf = unwrapAesKey(wrappedAuthKey);
-    if (aesKeyBuf.length !== 32) {
-      // Warn but continue attempt (maybe AES-128); but we assume AES-256
-      console.warn('unexpected aes key length', aesKeyBuf.length);
+
+    // 2) decrypt authBlob
+    let authPlain;
+    try {
+      authPlain = decryptAesGcm(aesKeyBuf, authIv, authBlob, authTag);
+    } catch (e) {
+      console.warn('auth decrypt failed', e.message);
+      return res.status(400).json({ error: 'auth_decrypt_failed' });
     }
 
-    // 2) decrypt authBlob to obtain JWT or auth payload
-    const authPlain = decryptAesGcm(aesKeyBuf, authIv, authBlob, authTag);
-    // authPlain expected to be JSON (e.g., { token: "..."} or JWT string). We'll treat it as either
-    let jwtToken = authPlain;
+    // 3) parse auth: could be JSON with token or raw token
+    let jwtToken = null;
     try {
       const parsed = JSON.parse(authPlain);
       if (parsed && parsed.token) jwtToken = parsed.token;
+      else jwtToken = authPlain;
     } catch (e) {
-      // not JSON, maybe raw JWT - ok
+      jwtToken = authPlain;
     }
 
-    // 3) validate JWT (support RS256 or HS256 depending on env)
+    // 4) validate JWT if configured
+    let authVerified = false;
     let decoded = null;
     if (JWT_PUBLIC_KEY_PEM) {
-      // RS256
-      decoded = jwt.verify(jwtToken, JWT_PUBLIC_KEY_PEM.replace(/\\n/g, '\n'), { algorithms: ['RS256'] });
+      try {
+        decoded = jwt.verify(jwtToken, JWT_PUBLIC_KEY_PEM.replace(/\\n/g, '\n'), { algorithms: ['RS256'] });
+        authVerified = true;
+      } catch (e) {
+        console.warn('jwt verify failed (RS256)', e.message);
+        return res.status(401).json({ error: 'invalid_token' });
+      }
     } else if (JWT_SECRET) {
-      decoded = jwt.verify(jwtToken, JWT_SECRET);
+      try {
+        decoded = jwt.verify(jwtToken, JWT_SECRET);
+        authVerified = true;
+      } catch (e) {
+        console.warn('jwt verify failed (HS256)', e.message);
+        return res.status(401).json({ error: 'invalid_token' });
+      }
     } else {
-      throw new Error('No JWT verification method configured');
+      // No JWT verification configured — WARNING: insecure for production
+      console.warn('No JWT verification configured. auth not verified.');
+      authVerified = false;
     }
-    // basic checks (exp, sub etc) are performed by jwt.verify. Additional checks:
-    // - Ensure senderId matches token subject or claim
-    if (decoded.sub && decoded.sub !== senderId) {
+
+    // Optional: check token subject matches senderId
+    if (authVerified && decoded && decoded.sub && decoded.sub !== senderId) {
       console.warn('token sub mismatch', decoded.sub, '!=', senderId);
-      // proceed or reject depending on policy. Here reject.
       return res.status(401).json({ error: 'invalid_token_subject' });
     }
 
-    // 4) store metadata and create message id + timestamp
-    const { id: messageId, serverTimestamp } = await storeMessageMeta({
+    // 5) persist message meta into DB file
+    const db = readDb();
+    const messageId = genId();
+    const serverTimestamp = new Date().toISOString();
+
+    db.messages[messageId] = {
+      id: messageId,
       senderId,
       recipientId,
       messageCiphertext,
-      aesIv: authIv
-    });
+      aesIv: authIv,
+      auth_verified: authVerified,
+      serverTimestamp,
+      status: 'queued',
+      created_at: new Date().toISOString()
+    };
+    writeDb(db);
 
-    // 5) fetch recipient push subscription
-    const pushSub = await getPushSubscription(recipientId);
+    // 6) find push subscription
+    const pushSub = db.push_subscriptions[recipientId];
     if (!pushSub) {
-      // no subscription: return success but mark undeliverable
-      await pool.query('UPDATE messages SET status = $1 WHERE id = $2', ['no-subscription', messageId]);
+      db.messages[messageId].status = 'no-subscription';
+      writeDb(db);
       return res.status(202).json({ message_id: messageId, status: 'no-subscription' });
     }
 
-    // 6) prepare push payload (minimal). Sign serverTimestamp optionally.
-    // For simplicity: send message_id and serverTimestamp
-    const payload = JSON.stringify({
-      message_id: messageId,
-      serverTimestamp: serverTimestamp.toISOString()
-    });
+    // 7) prepare minimal push payload (silent)
+    const payload = JSON.stringify({ message_id: messageId, serverTimestamp });
 
-    // 7) send web-push (silent push)
     try {
+      // web-push requires subscription object with endpoint and keys
       await webpush.sendNotification(pushSub, payload);
-      await pool.query('UPDATE messages SET status = $1 WHERE id = $2', ['pushed', messageId]);
-      return res.status(201).json({ message_id: messageId, status: 'pushed', serverTimestamp: serverTimestamp.toISOString() });
+      db.messages[messageId].status = 'pushed';
+      writeDb(db);
+      return res.status(201).json({ message_id: messageId, status: 'pushed', serverTimestamp });
     } catch (pushErr) {
-      console.error('web-push failed', pushErr);
-      await pool.query('UPDATE messages SET status = $1 WHERE id = $2', ['push-failed', messageId]);
+      console.error('web-push error', pushErr && pushErr.stack ? pushErr.stack : pushErr);
+      db.messages[messageId].status = 'push-failed';
+      writeDb(db);
       return res.status(201).json({ message_id: messageId, status: 'push-failed' });
     }
 
   } catch (err) {
-    console.error('message processing failed', err);
+    console.error('processing error', err && err.stack ? err.stack : err);
     return res.status(500).json({ error: 'processing_failed' });
-  }
-});
-
-// Endpoint to register/update push subscription
-app.post('/push-subscriptions', async (req, res) => {
-  const { userId, subscription } = req.body;
-  if (!userId || !subscription || !subscription.endpoint) return res.status(400).json({ error: 'invalid' });
-
-  try {
-    const p256dh = subscription.keys && subscription.keys.p256dh;
-    const authKey = subscription.keys && subscription.keys.auth;
-    await pool.query(`
-      INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, updated_at)
-      VALUES ($1, $2, $3, $4, now())
-      ON CONFLICT (user_id) DO UPDATE SET endpoint = $2, p256dh = $3, auth = $4, updated_at = now();
-    `, [userId, subscription.endpoint, p256dh, authKey]);
-
-    res.status(201).json({ ok: true });
-  } catch (e) {
-    console.error('failed to save subscription', e);
-    res.status(500).json({ error: 'db_failed' });
   }
 });
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
-const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`relay server listening on ${PORT}`);
+  console.log(`relay server listening on ${PORT}, DB_FILE=${DB_FILE}`);
 });
