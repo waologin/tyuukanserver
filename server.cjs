@@ -7,6 +7,7 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
 const webpush = require('web-push');
+const cors = require('cors');   // ← ① 追加
 
 // ---------- 環境変数設定 ----------
 const SERVER_RSA_PRIV_PEM = process.env.SERVER_RSA_PRIV_PEM;
@@ -14,6 +15,12 @@ const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY;
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
 const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:admin@example.com';
 const PORT = process.env.PORT || 3000;
+
+// ---------- 初期化 ----------
+webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+const app = express();
+app.use(cors());                // ← ② 追加（全オリジン許可）
+app.use(bodyParser.json({ limit: '512kb' }));
 
 // ---------- 検証 ----------
 if (!SERVER_RSA_PRIV_PEM) {
